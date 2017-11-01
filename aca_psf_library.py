@@ -16,6 +16,18 @@ HI = 4
 # Sampling this in 10 x 10 bins
 NBINS = 10
 
+EIGHT_LABELS = np.array([['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1', 'H1'],
+                         ['I1', 'J1', 'K1', 'L1', 'M1', 'N1', 'O1', 'P1'],
+                         ['A2', 'B2', 'C2', 'D2', 'E2', 'F2', 'G2', 'H2'],
+                         ['I2', 'J2', 'K2', 'L2', 'M2', 'N2', 'O2', 'P2'],
+                         ['A3', 'B3', 'C3', 'D3', 'E3', 'F3', 'G3', 'H3'],
+                         ['I3', 'J3', 'K3', 'L3', 'M3', 'N3', 'O3', 'P3'],
+                         ['A4', 'B4', 'C4', 'D4', 'E4', 'F4', 'G4', 'H4'],
+                         ['I4', 'J4', 'K4', 'L4', 'M4', 'N4', 'O4', 'P4']])
+
+
+BGDPIX = ['A1', 'B1', 'G1', 'H1', 'I4', 'J4', 'O4', 'P4']
+
 
 # Local copy of annie centroid_fm
 def prep_6x6(img, bgd=None):
@@ -58,7 +70,7 @@ def centroid_fm(img, bgd=None):
         img = prep_6x6(img, bgd)
         img[[0, 0, 5, 5], [0, 5, 0, 5]] = 0
 
-    norm = np.sum(img).clip(1, None)
+    norm = np.sum(img).clip(.01, None)
     row = np.sum(rw * img) / norm
     col = np.sum(cw * img) / norm
 
@@ -110,11 +122,15 @@ def obs_slot_psf(obsid, slot):
         # use the sum over two axes to sum up all the pixels in each 8x8 image
         norms = np.sum(loc_images, axis=(1, 2)).clip(1, None)
         # clip to just use images within 1% of median sum
+        # This would be too restrictive on anything but bright star data
         loc_images = loc_images[(abs(norms - np.median(norms)) / np.median(norms)) < .01]
         # May also decide to only use N images or other filters 
         # Also not sure if we want the mean or the median pixel value for each pixel at this point, but
         # Sigma clip these in pixel stacks (the axis=0 bit)
         loc_images = astropy.stats.sigma_clip(loc_images, axis=0, sigma=2)
+        # Are enough samples left around?
+        if np.any(np.sum(~loc_images.mask, axis=0) < 5):
+            raise ValueError
         # Get the mean image of the sigma-clip/masked data, throw out the mask 
         mean_image = np.mean(loc_images, axis=0).data
         # Normalize the mean image to one
@@ -135,7 +151,7 @@ def get_obs_slots():
     ok = ((gs['obsid'] > 38000)
           & (gs['dur'] > 26000)
           & (gs['sz'] == '8x8')
-          & (gs['aoacmag_mean'] < 6.7)
+          & (gs['aoacmag_mean'] < 6.5)
           & (gs['f_track'] > .99)
           & (gs['dy_std'] < .2)
           & (gs['dz_std'] < .2)
@@ -157,12 +173,64 @@ def make_library(guide_stars):
 
     multi_obs_psfs = []
     distributions = []
+    row_centroids = []
+    col_centroids = []
     for obs in guide_stars:
-        slot_psf, distribution, rs, cs = obs_slot_psf(obs['obsid'], obs['slot'])
+        try:
+            slot_psf, distribution, rs, cs = obs_slot_psf(obs['obsid'], obs['slot'])
+        except ValueError:
+            print("Not using {} {}".format(obs['obsid'], obs['slot']))
+            continue
         multi_obs_psfs.append(slot_psf)
         distributions.append(distribution)
+        row_centroids.append(rs)
+        col_centroids.append(cs)
 
+    if len(multi_obs_psfs) <= 1:
+        return slot_psf, distributions, row_centroids, col_centroids
     master_psf = combine_obs_psfs(multi_obs_psfs)
-    return master_psf, distributions
+    return master_psf, distributions, row_centroids, col_centroids
 
 
+def make_psf_table(psf):
+    rows = []
+    for loc in sorted(psf):
+        row = {'row_bin_idx': loc[0],
+               'col_bin_idx': loc[1],
+               'row_bin_left_edge': -0.5 + (loc[0] / NBINS),
+               'row_bin_right_edge': -0.5 + (loc[0] / NBINS) + (1 / NBINS),
+               'col_bin_left_edge': -0.5 + (loc[1] / NBINS),
+               'col_bin_right_edge': -0.5 + (loc[1] / NBINS) + (1 / NBINS)}
+        for pix_label in EIGHT_LABELS.flatten():
+            row[pix_label] = psf[loc][EIGHT_LABELS == pix_label][0]
+        rows.append(row)
+    cols = ['row_bin_idx', 'col_bin_idx',
+            'row_bin_left_edge', 'row_bin_right_edge',
+            'col_bin_left_edge', 'col_bin_right_edge']
+    # Put these in the iteration order
+    cols.extend(EIGHT_LABELS.flatten().tolist())
+    table = Table(rows)[cols]
+    for col in ['row_bin_left_edge', 'row_bin_right_edge',
+                'col_bin_left_edge', 'col_bin_right_edge']:
+        table[col].format = "3.1f"
+    for col in EIGHT_LABELS.flatten().tolist():
+        table[col].format = "8.6f"
+    return table
+
+def table_to_psf(t):
+    psf = {}
+    for row in t:
+        img = np.zeros((8, 8))
+        for pix_label in EIGHT_LABELS.flatten():
+            img[EIGHT_LABELS == pix_label] = row[pix_label]
+        psf[(row['row_bin_idx'], row['col_bin_idx'])] = img
+    return psf
+
+
+if __name__ == '__main__':
+    """Write out a library if run from cmdline"""
+
+    guide_stars = get_obs_slots()
+    psf, distrib, row_cen, col_cen = make_library(guide_stars)
+    table = make_psf_table(psf)
+    table.write("aca_psf_lib.dat", format='ascii')
