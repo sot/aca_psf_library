@@ -1,12 +1,13 @@
+import os
 import numpy as np
 from collections import defaultdict
+from itertools import chain
+from math import floor
+
 from astropy.table import Table
 import astropy.stats
-from Ska.Matplotlib import plot_cxctime
 from mica.archive import aca_l0
-from mica.starcheck import get_starcheck_catalog
 from kadi import events
-import matplotlib.pyplot as plt
 from mica.stats import guide_stats
 
 # The centroids we want are between the middle of the 4th pixel [idx 3] and middle of the
@@ -27,6 +28,109 @@ EIGHT_LABELS = np.array([['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1', 'H1'],
 
 
 BGDPIX = ['A1', 'B1', 'G1', 'H1', 'I4', 'J4', 'O4', 'P4']
+
+
+class AcaPsfLibrary(object):
+    drc = 0.1  # Height/width of PSF bin in pixels
+
+    def __init__(self):
+        psfs = {}
+
+        filename = os.path.join(os.path.dirname(__file__), 'aca_psf_lib.dat')
+        dat = Table.read(filename, format='ascii.basic', guess=False)
+        self.dat = dat
+
+        for row in dat:
+            ii = row['row_bin_idx']
+            jj = row['col_bin_idx']
+            psf = np.array([row[label] for label in chain(*EIGHT_LABELS)]).reshape(8, 8)
+            psfs[ii, jj] = psf
+
+        # Pad the PSF library by an extra bin around the edge.  This should really be
+        # done in the original PSF library.
+        n_bin = np.max(dat['row_bin_idx']) + 1
+        for ii_out in range(-1, n_bin + 1):
+            ii_in = np.mod(ii_out, n_bin)
+            ii_slice_in, ii_slice_out = self._get_slices(ii_out, n_bin)
+
+            for jj_out in range(-1, n_bin + 1):
+                if (ii_out, jj_out) in psfs:
+                    continue
+
+                jj_in = np.mod(jj_out, n_bin)
+                jj_slice_in, jj_slice_out = self._get_slices(jj_out, n_bin)
+
+                psf = np.zeros(shape=(8, 8), dtype=float)
+                psf[ii_slice_out, jj_slice_out] = psfs[ii_in, jj_in][ii_slice_in, jj_slice_in]
+                psfs[ii_out, jj_out] = psf
+
+        self.psfs = psfs
+
+    @staticmethod
+    def _get_slices(idx, n_bin):
+        if idx == -1:
+            slice_in = slice(1, None)
+            slice_out = slice(None, -1)
+        elif idx == n_bin:
+            slice_in = slice(None, -1)
+            slice_out = slice(1, None)
+        else:
+            slice_in = slice(None, None)
+            slice_out = slice(None, None)
+        return slice_in, slice_out
+
+    def get_psf(self, row, col, pix_zero_loc='center'):
+        """
+        Get interpolated ACA PSF that corresponds to pixel location ``row``, ``col``.
+
+        :param row: float row value of PSF centroid
+        :param col: float col value of PSF centroid
+        :param pix_zero_loc: row/col coords are integral at 'edge' or 'center'
+
+        :returns: 8x8 PSF image normalized to 1.0
+        """
+        drc = self.drc
+
+        if pix_zero_loc == 'center':
+            # Transform to 'edge' coordinates (pixel lower-left corner at 0.0, 0.0)
+            row = row + 0.5
+            col = col + 0.5
+        elif pix_zero_loc != 'edge':
+            raise ValueError("pix_zero_loc can be only 'edge' or 'center'")
+
+        # Subpixel position in range (-0.5, 0.5)
+        r = row - round(row)
+        c = col - round(col)
+
+        # Floating point index into PSF library in range (0.0, 10.0)
+        # (assuming 10x10 grid of PSFs covering central pixel
+        ix = (r + 0.5) / drc - 0.5
+        iy = (c + 0.5) / drc - 0.5
+
+        # Int index into PSF library
+        ii = int(floor(ix))
+        jj = int(floor(iy))
+
+        # Following wikipedia notation (Unit Square section of
+        # https://en.wikipedia.org/wiki/Bilinear_interpolation)
+
+        # Float index within subpixel bin in range (0, 1)
+        x = ix - ii
+        y = iy - jj
+
+        # Finally the bilinear interpolation of the PSF images.
+        f = self.psfs
+        b0 = (1 - x) * (1 - y)
+        b1 = x * (1 - y)
+        b2 = (1 - x) * y
+        b3 = x * y
+        P0 = f[ii, jj]
+        P1 = f[ii + 1, jj]
+        P2 = f[ii, jj + 1]
+        P3 = f[ii + 1, jj + 1]
+        psf = P0 * b0 + P1 * b1 + P2 * b2 + P3 * b3
+
+        return psf
 
 
 # Local copy of annie centroid_fm
@@ -50,29 +154,50 @@ def prep_6x6(img, bgd=None):
     return img
 
 
-def centroid_fm(img, bgd=None):
+def centroid_fm(img, bgd=None, pix_zero_loc='center', norm_clip=None):
     """
     First moment centroid of ``img``.
-    Return FM centroid in coords where lower left pixel of
-    image has value (0.0, 0.0) at the center.
+
+    Return FM centroid in coords where lower left pixel of image has value
+    (0.0, 0.0) at the center (for pix_zero_loc='center') or the lower-left edge
+    (for pix_zero_loc='edge').
+
     :param img: NxN ndarray
     :param bgd: background to subtract, float of NXN ndarray
+    :param pix_zero_loc: row/col coords are integral at 'edge' or 'center'
+    :param norm_clip: clip image norm at this min value (default is None and
+                      implies Exception for non-positive norm)
+
     :returns: row, col, norm float
     """
 
     sz_r, sz_c = img.shape
-    rw, cw = np.mgrid[0:sz_r, 0:sz_c]
+    if sz_r != sz_c:
+        raise ValueError('input img must be square')
 
-    if sz_r == 8:
-        rw, cw = np.mgrid[1:7, 1:7]
+    rw, cw = np.mgrid[1:7, 1:7] if sz_r == 8 else np.mgrid[0:sz_r, 0:sz_r]
 
     if sz_r in (6, 8):
         img = prep_6x6(img, bgd)
         img[[0, 0, 5, 5], [0, 5, 0, 5]] = 0
 
-    norm = np.sum(img).clip(.01, None)
+    norm = np.sum(img)
+    if norm_clip is not None:
+        norm = norm.clip(norm_clip, None)
+    else:
+        if norm <= 0:
+            raise ValueError('non-positive image norm {}'.format(norm))
+
     row = np.sum(rw * img) / norm
     col = np.sum(cw * img) / norm
+
+    if pix_zero_loc == 'edge':
+        # Transform row/col values from 'center' convention (as returned
+        # by centroiding) to the 'edge' convention requested by user.
+        row = row + 0.5
+        col = col + 0.5
+    elif pix_zero_loc != 'center':
+        raise ValueError("pix_zero_loc can be only 'edge' or 'center'")
 
     return row, col, norm
 
@@ -217,6 +342,7 @@ def make_psf_table(psf):
         table[col].format = "8.6f"
     return table
 
+
 def table_to_psf(t):
     psf = {}
     for row in t:
@@ -227,8 +353,8 @@ def table_to_psf(t):
     return psf
 
 
-if __name__ == '__main__':
-    """Write out a library if run from cmdline"""
+def create_psf_library():
+    """Make and write out a library"""
 
     guide_stars = get_obs_slots()
     psf, distrib, row_cen, col_cen = make_library(guide_stars)
