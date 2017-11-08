@@ -46,38 +46,7 @@ class AcaPsfLibrary(object):
             psf = np.array([row[label] for label in chain(*EIGHT_LABELS)]).reshape(8, 8)
             psfs[ii, jj] = psf
 
-        # Pad the PSF library by an extra bin around the edge.  This should really be
-        # done in the original PSF library.
-        n_bin = np.max(dat['row_bin_idx']) + 1
-        for ii_out in range(-1, n_bin + 1):
-            ii_in = np.mod(ii_out, n_bin)
-            ii_slice_in, ii_slice_out = self._get_slices(ii_out, n_bin)
-
-            for jj_out in range(-1, n_bin + 1):
-                if (ii_out, jj_out) in psfs:
-                    continue
-
-                jj_in = np.mod(jj_out, n_bin)
-                jj_slice_in, jj_slice_out = self._get_slices(jj_out, n_bin)
-
-                psf = np.zeros(shape=(8, 8), dtype=float)
-                psf[ii_slice_out, jj_slice_out] = psfs[ii_in, jj_in][ii_slice_in, jj_slice_in]
-                psfs[ii_out, jj_out] = psf
-
         self.psfs = psfs
-
-    @staticmethod
-    def _get_slices(idx, n_bin):
-        if idx == -1:
-            slice_in = slice(1, None)
-            slice_out = slice(None, -1)
-        elif idx == n_bin:
-            slice_in = slice(None, -1)
-            slice_out = slice(1, None)
-        else:
-            slice_in = slice(None, None)
-            slice_out = slice(None, None)
-        return slice_in, slice_out
 
     def get_psf(self, row, col, pix_zero_loc='center'):
         """
@@ -353,10 +322,46 @@ def table_to_psf(t):
     return psf
 
 
+def pad_psf_library(psfs):
+    """Pad the PSF library by an extra bin around the edge.
+
+    This uses the corresponding "translated" PSF from 1.0 pixels over.  To
+    generate the pixel at r, c = -0.05, 0.5, use the one from 0.95, 0.5 and then
+    shift the PSF image pixels by 1 pixel in row.
+    """
+    def get_slices(idx):
+        if idx == -1:
+            slice_in = slice(1, None)
+            slice_out = slice(None, -1)
+        elif idx == NBINS:
+            slice_in = slice(None, -1)
+            slice_out = slice(1, None)
+        else:
+            slice_in = slice(None, None)
+            slice_out = slice(None, None)
+        return slice_in, slice_out
+
+    for ii_out in range(-1, NBINS + 1):
+        ii_in = np.mod(ii_out, NBINS)
+        ii_slice_in, ii_slice_out = get_slices(ii_out)
+
+        for jj_out in range(-1, NBINS + 1):
+            if (ii_out, jj_out) in psfs:
+                continue
+
+            jj_in = np.mod(jj_out, NBINS)
+            jj_slice_in, jj_slice_out = get_slices(jj_out)
+
+            psf = np.zeros(shape=(8, 8), dtype=float)
+            psf[ii_slice_out, jj_slice_out] = psfs[ii_in, jj_in][ii_slice_in, jj_slice_in]
+            psfs[ii_out, jj_out] = psf
+
+
 def create_psf_library():
     """Make and write out a library"""
 
     guide_stars = get_obs_slots()
     psf, distrib, row_cen, col_cen = make_library(guide_stars)
+    pad_psf_library(psf)
     table = make_psf_table(psf)
-    table.write("aca_psf_lib.dat", format='ascii')
+    table.write("aca_psf_lib.dat", format='ascii', overwrite=True)
