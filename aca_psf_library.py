@@ -186,7 +186,7 @@ def obs_slot_psf(obsid, slot):
 
     psf_map = defaultdict(list)
     bin_edges = np.linspace(LOW, HI, NBINS + 1)
-    mid = (LOW + HI ) / 2.
+    mid = (LOW + HI) / 2.
     rs = []
     cs = []
     for img in images:
@@ -203,7 +203,7 @@ def obs_slot_psf(obsid, slot):
         cb = np.digitize([c], bin_edges)[0] - 1
         psf_map[(rb, cb)].append(img)
 
-    #Bin the centroid locations in the middle up in a 10x10 array just to see distribution
+    # Bin the centroid locations in the middle up in a 10x10 array just to see distribution
     H, xedges, yedges = np.histogram2d(rs, cs, bins=[NBINS, NBINS], range=[[LOW, HI], [LOW, HI]])
 
     # Make psf images
@@ -218,14 +218,16 @@ def obs_slot_psf(obsid, slot):
         # clip to just use images within 1% of median sum
         # This would be too restrictive on anything but bright star data
         loc_images = loc_images[(abs(norms - np.median(norms)) / np.median(norms)) < .01]
-        # May also decide to only use N images or other filters 
-        # Also not sure if we want the mean or the median pixel value for each pixel at this point, but
+        # May also decide to only use N images or other filters.  Also not sure
+        # if we want the mean or the median pixel value for each pixel at this
+        # point.
+
         # Sigma clip these in pixel stacks (the axis=0 bit)
         loc_images = astropy.stats.sigma_clip(loc_images, axis=0, sigma=2)
         # Are enough samples left around?
         if np.any(np.sum(~loc_images.mask, axis=0) < 5):
-            raise ValueError
-        # Get the mean image of the sigma-clip/masked data, throw out the mask 
+            raise ValueError()
+        # Get the mean image of the sigma-clip/masked data, throw out the mask
         mean_image = np.mean(loc_images, axis=0).data
         # Normalize the mean image to one
         psf_images[loc] = mean_image / np.sum(mean_image)
@@ -235,21 +237,23 @@ def obs_slot_psf(obsid, slot):
 
 def get_obs_slots():
     """
-    Use the guide star database to get a Table of long-ish ER observations with bright stars tracked well
-    I've used the old n100_warm_frac as a proxy for expected low-ish dark current, though the residuals
-    probably support this just as well.  This doesn't check for dither-disabled explicitly; I'm hoping we'd be
-    sensitive to that via the check that there is good centroid coverage within the observation.
+    Use the guide star database to get a Table of long-ish ER observations with
+    bright stars tracked well I've used the old n100_warm_frac as a proxy for
+    expected low-ish dark current, though the residuals probably support this
+    just as well.  This doesn't check for dither-disabled explicitly; I'm hoping
+    we'd be sensitive to that via the check that there is good centroid coverage
+    within the observation.
     """
     gs = Table(guide_stats.get_stats())
     gs['dur'] = gs['npnt_tstop'].astype(float) - gs['kalman_tstart']
-    ok = ((gs['obsid'] > 38000)
-          & (gs['dur'] > 26000)
-          & (gs['sz'] == '8x8')
-          & (gs['aoacmag_mean'] < 6.5)
-          & (gs['f_track'] > .99)
-          & (gs['dy_std'] < .2)
-          & (gs['dz_std'] < .2)
-      & (gs['n100_warm_frac'] < .10))
+    ok = ((gs['obsid'] > 38000) &
+          (gs['dur'] > 26000) &
+          (gs['sz'] == '8x8') &
+          (gs['aoacmag_mean'] < 6.5) &
+          (gs['f_track'] > .99) &
+          (gs['dy_std'] < .2) &
+          (gs['dz_std'] < .2) &
+          (gs['n100_warm_frac'] < .10))
     return gs[ok]
 
 
