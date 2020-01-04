@@ -1,13 +1,15 @@
+import os
 import numpy as np
 from collections import defaultdict
+from itertools import chain
+from math import floor
+
 from astropy.table import Table
 import astropy.stats
-from Ska.Matplotlib import plot_cxctime
 from mica.archive import aca_l0
-from mica.starcheck import get_starcheck_catalog
 from kadi import events
-import matplotlib.pyplot as plt
 from mica.stats import guide_stats
+from chandra_aca.aca_image import centroid_fm
 
 # The centroids we want are between the middle of the 4th pixel [idx 3] and middle of the
 # 5th pixel [idx 4]
@@ -29,52 +31,76 @@ EIGHT_LABELS = np.array([['A1', 'B1', 'C1', 'D1', 'E1', 'F1', 'G1', 'H1'],
 BGDPIX = ['A1', 'B1', 'G1', 'H1', 'I4', 'J4', 'O4', 'P4']
 
 
-# Local copy of annie centroid_fm
-def prep_6x6(img, bgd=None):
-    """
-    Subtract background and in case of 8x8 image
-    cut and return the 6x6 inner section.
-    """
-    # Cast to an ndarray (without copying)
-    img = img.view(np.ndarray)
+class AcaPsfLibrary(object):
+    drc = 0.1  # Height/width of PSF bin in pixels
 
-    if isinstance(bgd, np.ndarray):
-        bgd = bgd.view(np.ndarray)
+    def __init__(self):
+        psfs = {}
 
-    if bgd is not None:
-        img = img - bgd
+        filename = os.path.join(os.path.dirname(__file__), 'aca_psf_lib.dat')
+        dat = Table.read(filename, format='ascii.basic', guess=False)
+        self.dat = dat
 
-    if img.shape == (8, 8):
-        img = img[1:7, 1:7]
+        for row in dat:
+            ii = row['row_bin_idx']
+            jj = row['col_bin_idx']
+            psf = np.array([row[label] for label in chain(*EIGHT_LABELS)]).reshape(8, 8)
+            psfs[ii, jj] = psf
 
-    return img
+        self.psfs = psfs
 
+    def get_psf(self, row, col, pix_zero_loc='center'):
+        """
+        Get interpolated ACA PSF that corresponds to pixel location ``row``, ``col``.
 
-def centroid_fm(img, bgd=None):
-    """
-    First moment centroid of ``img``.
-    Return FM centroid in coords where lower left pixel of
-    image has value (0.0, 0.0) at the center.
-    :param img: NxN ndarray
-    :param bgd: background to subtract, float of NXN ndarray
-    :returns: row, col, norm float
-    """
+        :param row: float row value of PSF centroid
+        :param col: float col value of PSF centroid
+        :param pix_zero_loc: row/col coords are integral at 'edge' or 'center'
 
-    sz_r, sz_c = img.shape
-    rw, cw = np.mgrid[0:sz_r, 0:sz_c]
+        :returns: 8x8 PSF image normalized to 1.0
+        """
+        drc = self.drc
 
-    if sz_r == 8:
-        rw, cw = np.mgrid[1:7, 1:7]
+        if pix_zero_loc == 'center':
+            # Transform to 'edge' coordinates (pixel lower-left corner at 0.0, 0.0)
+            row = row + 0.5
+            col = col + 0.5
+        elif pix_zero_loc != 'edge':
+            raise ValueError("pix_zero_loc can be only 'edge' or 'center'")
 
-    if sz_r in (6, 8):
-        img = prep_6x6(img, bgd)
-        img[[0, 0, 5, 5], [0, 5, 0, 5]] = 0
+        # Subpixel position in range (-0.5, 0.5)
+        r = row - round(row)
+        c = col - round(col)
 
-    norm = np.sum(img).clip(.01, None)
-    row = np.sum(rw * img) / norm
-    col = np.sum(cw * img) / norm
+        # Floating point index into PSF library in range (0.0, 10.0)
+        # (assuming 10x10 grid of PSFs covering central pixel
+        ix = (r + 0.5) / drc - 0.5
+        iy = (c + 0.5) / drc - 0.5
 
-    return row, col, norm
+        # Int index into PSF library
+        ii = int(floor(ix))
+        jj = int(floor(iy))
+
+        # Following wikipedia notation (Unit Square section of
+        # https://en.wikipedia.org/wiki/Bilinear_interpolation)
+
+        # Float index within subpixel bin in range (0, 1)
+        x = ix - ii
+        y = iy - jj
+
+        # Finally the bilinear interpolation of the PSF images.
+        f = self.psfs
+        b0 = (1 - x) * (1 - y)
+        b1 = x * (1 - y)
+        b2 = (1 - x) * y
+        b3 = x * y
+        P0 = f[ii, jj]
+        P1 = f[ii + 1, jj]
+        P2 = f[ii, jj + 1]
+        P3 = f[ii + 1, jj + 1]
+        psf = P0 * b0 + P1 * b1 + P2 * b2 + P3 * b3
+
+        return psf
 
 
 # generalize this so we can use gaussian later
@@ -92,7 +118,7 @@ def obs_slot_psf(obsid, slot):
 
     psf_map = defaultdict(list)
     bin_edges = np.linspace(LOW, HI, NBINS + 1)
-    mid = (LOW + HI ) / 2.
+    mid = (LOW + HI) / 2.
     rs = []
     cs = []
     for img in images:
@@ -109,7 +135,7 @@ def obs_slot_psf(obsid, slot):
         cb = np.digitize([c], bin_edges)[0] - 1
         psf_map[(rb, cb)].append(img)
 
-    #Bin the centroid locations in the middle up in a 10x10 array just to see distribution
+    # Bin the centroid locations in the middle up in a 10x10 array just to see distribution
     H, xedges, yedges = np.histogram2d(rs, cs, bins=[NBINS, NBINS], range=[[LOW, HI], [LOW, HI]])
 
     # Make psf images
@@ -124,14 +150,16 @@ def obs_slot_psf(obsid, slot):
         # clip to just use images within 1% of median sum
         # This would be too restrictive on anything but bright star data
         loc_images = loc_images[(abs(norms - np.median(norms)) / np.median(norms)) < .01]
-        # May also decide to only use N images or other filters 
-        # Also not sure if we want the mean or the median pixel value for each pixel at this point, but
+        # May also decide to only use N images or other filters.  Also not sure
+        # if we want the mean or the median pixel value for each pixel at this
+        # point.
+
         # Sigma clip these in pixel stacks (the axis=0 bit)
         loc_images = astropy.stats.sigma_clip(loc_images, axis=0, sigma=2)
         # Are enough samples left around?
         if np.any(np.sum(~loc_images.mask, axis=0) < 5):
-            raise ValueError
-        # Get the mean image of the sigma-clip/masked data, throw out the mask 
+            raise ValueError()
+        # Get the mean image of the sigma-clip/masked data, throw out the mask
         mean_image = np.mean(loc_images, axis=0).data
         # Normalize the mean image to one
         psf_images[loc] = mean_image / np.sum(mean_image)
@@ -141,21 +169,23 @@ def obs_slot_psf(obsid, slot):
 
 def get_obs_slots():
     """
-    Use the guide star database to get a Table of long-ish ER observations with bright stars tracked well
-    I've used the old n100_warm_frac as a proxy for expected low-ish dark current, though the residuals
-    probably support this just as well.  This doesn't check for dither-disabled explicitly; I'm hoping we'd be
-    sensitive to that via the check that there is good centroid coverage within the observation.
+    Use the guide star database to get a Table of long-ish ER observations with
+    bright stars tracked well I've used the old n100_warm_frac as a proxy for
+    expected low-ish dark current, though the residuals probably support this
+    just as well.  This doesn't check for dither-disabled explicitly; I'm hoping
+    we'd be sensitive to that via the check that there is good centroid coverage
+    within the observation.
     """
     gs = Table(guide_stats.get_stats())
     gs['dur'] = gs['npnt_tstop'].astype(float) - gs['kalman_tstart']
-    ok = ((gs['obsid'] > 38000)
-          & (gs['dur'] > 26000)
-          & (gs['sz'] == '8x8')
-          & (gs['aoacmag_mean'] < 6.5)
-          & (gs['f_track'] > .99)
-          & (gs['dy_std'] < .2)
-          & (gs['dz_std'] < .2)
-      & (gs['n100_warm_frac'] < .10))
+    ok = ((gs['obsid'] > 38000) &
+          (gs['dur'] > 26000) &
+          (gs['sz'] == '8x8') &
+          (gs['aoacmag_mean'] < 6.5) &
+          (gs['f_track'] > .99) &
+          (gs['dy_std'] < .2) &
+          (gs['dz_std'] < .2) &
+          (gs['n100_warm_frac'] < .10))
     return gs[ok]
 
 
@@ -217,6 +247,7 @@ def make_psf_table(psf):
         table[col].format = "8.6f"
     return table
 
+
 def table_to_psf(t):
     psf = {}
     for row in t:
@@ -227,10 +258,46 @@ def table_to_psf(t):
     return psf
 
 
-if __name__ == '__main__':
-    """Write out a library if run from cmdline"""
+def pad_psf_library(psfs):
+    """Pad the PSF library by an extra bin around the edge.
+
+    This uses the corresponding "translated" PSF from 1.0 pixels over.  To
+    generate the pixel at r, c = -0.05, 0.5, use the one from 0.95, 0.5 and then
+    shift the PSF image pixels by 1 pixel in row.
+    """
+    def get_slices(idx):
+        if idx == -1:
+            slice_in = slice(1, None)
+            slice_out = slice(None, -1)
+        elif idx == NBINS:
+            slice_in = slice(None, -1)
+            slice_out = slice(1, None)
+        else:
+            slice_in = slice(None, None)
+            slice_out = slice(None, None)
+        return slice_in, slice_out
+
+    for ii_out in range(-1, NBINS + 1):
+        ii_in = np.mod(ii_out, NBINS)
+        ii_slice_in, ii_slice_out = get_slices(ii_out)
+
+        for jj_out in range(-1, NBINS + 1):
+            if (ii_out, jj_out) in psfs:
+                continue
+
+            jj_in = np.mod(jj_out, NBINS)
+            jj_slice_in, jj_slice_out = get_slices(jj_out)
+
+            psf = np.zeros(shape=(8, 8), dtype=float)
+            psf[ii_slice_out, jj_slice_out] = psfs[ii_in, jj_in][ii_slice_in, jj_slice_in]
+            psfs[ii_out, jj_out] = psf
+
+
+def create_psf_library():
+    """Make and write out a library"""
 
     guide_stars = get_obs_slots()
     psf, distrib, row_cen, col_cen = make_library(guide_stars)
+    pad_psf_library(psf)
     table = make_psf_table(psf)
-    table.write("aca_psf_lib.dat", format='ascii')
+    table.write("aca_psf_lib.dat", format='ascii', overwrite=True)
